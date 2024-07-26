@@ -1,89 +1,122 @@
+import json
 import logging
-import urllib.parse
-from datetime import datetime
+import random
+import time
+from datetime import date, timedelta
+
+import requests
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 
 from src.browser import Browser
 from src.utils import Utils
 
-from .activities import Activities
 
-import requests
-from requests_oauthlib import OAuth2Session
-import secrets
-import time
-import random
-
-client_id = '0000000040170455'
-authorization_base_url = 'https://login.live.com/oauth20_authorize.srf'
-token_url = 'https://login.microsoftonline.com/consumers/oauth2/v2.0/token'
-redirect_uri = ' https://login.live.com/oauth20_desktop.srf'
-scope = [ "service::prod.rewardsplatform.microsoft.com::MBI_SSL"]
-
-class ReadToEarn:
+class Searches:
     def __init__(self, browser: Browser):
         self.browser = browser
         self.webdriver = browser.webdriver
-        self.activities = Activities(browser)
-    
-    def completeReadToEarn(self,startingPoints):
-        
-        logging.info("[READ TO EARN] " + "Trying to complete Read to Earn...")
-        
-        accountName = self.browser.username
-        
-        # Should Really Cache Token and load it in.
-        # To Save token
-        #with open('token.pickle', 'wb') as f:
-        #    pickle.dump(token, f)
-        # To Load token
-        #with open('token.pickle', 'rb') as f:
-        #   token = pickle.load(f)
-        #mobileApp = OAuth2Session(client_id, scope=scope, token=token)
-        
-        # Use Webdriver to get OAuth2 Token
-        # This works, since you already logged into Bing, so no user interaction needed
-        
-        mobileApp = OAuth2Session(client_id, scope=scope, redirect_uri=redirect_uri)
-        authorization_url, state = mobileApp.authorization_url(authorization_base_url, access_type="offline_access", login_hint=accountName)
-        
-        # Get Referer URL from webdriver
-        self.webdriver.get(authorization_url)
-        while True:
-            logging.info("[READ TO EARN] Waiting for Login")
-            if self.webdriver.current_url[:48] == "https://login.live.com/oauth20_desktop.srf?code=":
-                redirect_response = self.webdriver.current_url
-                break
-            time.sleep(1)
-            
-        logging.info("[READ TO EARN] Logged-in successfully !")
-        # Use returned URL to create a token
-        token = mobileApp.fetch_token(token_url, authorization_response=redirect_response,include_client_id=True)
-        
-        # json data to confirm an article is read
-        json_data = {
-            "amount": 1,
-            # "country": "us",
-            "country": self.browser.localeGeo.lower(),
-            "id": 1,
-            "type": 101,
-            "attributes": {
-                "offerid": "ENUS_readarticle3_30points",
-            },
-        }
 
-        balance = startingPoints
-        # 10 is the most articles you can read. Sleep time is a guess, not tuned
-        for i in range(10):
-            # Replace ID with a random value so get credit for a new article
-            json_data['id'] = secrets.token_hex(64)
-            r = mobileApp.post("https://prod.rewardsplatform.microsoft.com/dapi/me/activities",json=json_data)
-            newbalance = r.json().get("response").get("balance")
-            if newbalance == balance:
-                logging.info("[READ TO EARN] Read All Available Articles !")
-                break
+    def getGoogleTrends(self, wordsCount: int) -> list:
+        # Function to retrieve Google Trends search terms
+        searchTerms: list[str] = []
+        i = 0
+        while len(searchTerms) < wordsCount:
+            i += 1
+            # Fetching daily trends from Google Trends API
+            r = requests.get(
+                f'https://trends.google.com/trends/api/dailytrends?hl={self.browser.localeLang}&ed={(date.today() - timedelta(days=i)).strftime("%Y%m%d")}&geo={self.browser.localeGeo}&ns=15'
+            )
+            trends = json.loads(r.text[6:])
+            for topic in trends["default"]["trendingSearchesDays"][0][
+                "trendingSearches"
+            ]:
+                searchTerms.append(topic["title"]["query"].lower())
+                searchTerms.extend(
+                    relatedTopic["query"].lower()
+                    for relatedTopic in topic["relatedQueries"]
+                )
+            searchTerms = list(set(searchTerms))
+        del searchTerms[wordsCount : (len(searchTerms) + 1)]
+        return searchTerms
+
+    def getRelatedTerms(self, word: str) -> list:
+        # Function to retrieve related terms from Bing API
+        try:
+            r = requests.get(
+                f"https://api.bing.com/osjson.aspx?query={word}",
+                headers={"User-agent": self.browser.userAgent},
+            )
+            return r.json()[1]
+        except Exception:  # pylint: disable=broad-except
+            return []
+
+    def bingSearches(self, numberOfSearches: int, pointsCounter: int = 0):
+        # Function to perform Bing searches
+        logging.info(
+            f"[BING] Starting {self.browser.browserType.capitalize()} Edge Bing searches..."
+        )
+
+        search_terms = self.getGoogleTrends(numberOfSearches)
+        self.webdriver.get("https://bing.com")
+
+        i = 0
+        attempt = 0
+        for word in search_terms:
+            i += 1
+            logging.info(f"[BING] {i}/{numberOfSearches}")
+            points = self.bingSearch(word)
+            if points <= pointsCounter:
+                relatedTerms = self.getRelatedTerms(word)[:0]
+                for term in relatedTerms:
+                    points = self.bingSearch(term)
+                    if not points <= pointsCounter:
+                        break
+            if points > 0:
+                pointsCounter = points
             else:
-                logging.info("[READ TO EARN] Read Article " + str(i+1))
-                balance = newbalance
-                time.sleep(random.randint(100, 180))
-        
-        logging.info("[READ TO EARN] Completed the Read to Earn successfully !") 
+                break
+
+            if points <= pointsCounter:
+                attempt += 1
+                if attempt == 2:
+                    logging.warning(
+                        "[BING] Possible blockage. Refreshing the page."
+                    )
+                    self.webdriver.refresh()
+                    attempt = 0
+        logging.info(
+            f"[BING] Finished {self.browser.browserType.capitalize()} Edge Bing searches !"
+        )
+        return pointsCounter
+
+    def bingSearch(self, word: str):
+        # Function to perform a single Bing search
+        i = 0
+
+        while True:
+            try:
+                self.browser.utils.waitUntilClickable(By.ID, "sb_form_q")
+                searchbar = self.webdriver.find_element(By.ID, "sb_form_q")
+                searchbar.clear()
+                for char in word:
+                    searchbar.send_keys(char)
+                    delay = random.uniform(0.2, 1)
+                    time.sleep(delay)
+                searchbar.submit()
+                time.sleep(Utils.randomSeconds(200, 300))
+
+                # Scroll down after the search (adjust the number of scrolls as needed)
+                for _ in range(3):  # Scroll down 3 times
+                    self.webdriver.execute_script(
+                        "window.scrollTo(0, document.body.scrollHeight);"
+                    )
+                    time.sleep(
+                        Utils.randomSeconds(7, 10)
+                    )  # Random wait between scrolls
+
+                    return self.browser.utils.getBingAccountPoints()
+                logging.error("[BING] " + "Timeout, retrying in 5~ seconds...")
+                time.sleep(Utils.randomSeconds(7, 15))
+                continue
